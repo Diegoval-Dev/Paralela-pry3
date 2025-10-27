@@ -8,6 +8,7 @@
  To build use  : make
  ============================================================================
  */
+#define _USE_MATH_DEFINES
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
