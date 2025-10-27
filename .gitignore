@@ -1,1 +1,60 @@
 *.pdf
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+*.idb
+
+# CUDA temp/intermediate files
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.nvvp
+*.nvvm
+*.log
+*.cache
+
+# VS build directories
+/.vs/
+/Debug/
+/Release/
+/x64/
+/x86/
+/ipch/
+/out/
+/bin/
+/build/
+/CMakeFiles/
+/CMakeCache.txt
+*.sln
+*.vcxproj*
+*.user
+*.opensdf
+*.sdf
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Python virtualenvs (if used)
+venv/
+.env/
+
+# Temporary test images or outputs
+*.pgm
+*.ppm
+*.png
+*.jpg
+*.jpeg
+*.bmp
+
+# Misc
+*.bak
+*.tmp
