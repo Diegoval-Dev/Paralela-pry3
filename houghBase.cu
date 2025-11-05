@@ -82,38 +82,72 @@ void CPU_HoughTran(unsigned char *pic, int w, int h, int **acc,
 
 // GPU kernel. One thread per image pixel is spawned.
 // The accummulator memory needs to be allocated by the host in global memory
-__global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float rMax, float rScale, float *d_Cos, float *d_Sin)
+// GPU kernel baseline: 1 hilo por píxel, usa tablas cos/sin en global
+__global__ void accumulateHoughGPU(const unsigned char *pic, int w, int h,
+                                   int *acc, float rMax, float rScale,
+                                   const float *d_Cos, const float *d_Sin)
 {
-  //TODO calcular: int gloID = ?
   int gloID = blockIdx.x * blockDim.x + threadIdx.x;
-  if (gloID > w * h) return;      // in case of extra threads in block
+  if (gloID >= w * h) return;      // ¡Ojo! >= (no >)
 
-  int xCent = w / 2;
-  int yCent = h / 2;
+  const int xCent = w / 2;
+  const int yCent = h / 2;
 
-  //TODO explicar bien bien esta parte. Dibujar un rectangulo a modo de imagen sirve para visualizarlo mejor
-  int xCoord = gloID % w - xCent;
-  int yCoord = yCent - gloID / w;
+  // Origen al centro y eje Y hacia arriba (convención cartesiana)
+  int xCoord = (gloID % w) - xCent;
+  int yCoord = yCent - (gloID / w);
 
-  //TODO eventualmente usar memoria compartida para el acumulador
+  // Sólo votan los píxeles > 0 (asumiendo imagen ya umbralizada/edges)
+  if (pic[gloID] == 0) return;
 
-  if (pic[gloID] > 0)
-    {
-      for (int tIdx = 0; tIdx < degreeBins; tIdx++)
-        {
-          //TODO utilizar memoria constante para senos y cosenos
-          //float r = xCoord * cos(tIdx) + yCoord * sin(tIdx); //probar con esto para ver diferencia en tiempo
-          float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
-          int rIdx = (r + rMax) / rScale;
-          //debemos usar atomic, pero que race condition hay si somos un thread por pixel? explique
-          atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
-        }
-    }
+  for (int tIdx = 0; tIdx < degreeBins; ++tIdx)
+  {
+    float r = __fmaf_rn((float)xCoord, d_Cos[tIdx], (float)yCoord * d_Sin[tIdx]);
+    float v = (r + rMax) / rScale;
+    int rIdx = __float2int_rn(v);
+    if (rIdx < 0) rIdx = 0;
+    else if (rIdx >= rBins) rIdx = rBins - 1;
 
-  //TODO eventualmente cuando se tenga memoria compartida, copiar del local al global
-  //utilizar operaciones atomicas para seguridad
-  //faltara sincronizar los hilos del bloque en algunos lados
+    atomicAdd(&acc[rIdx * degreeBins + tIdx], 1);
+  }
+}
 
+//*****************************************************************
+// Helper: precompute sin/cos table on host
+static void computeSinCosTable(float *pcCos, float *pcSin, int degreeBins) {
+  const float deg2rad = (float)M_PI / 180.0f;
+  const float stepDeg = 180.0f / degreeBins; // con degreeInc=2 → 2°
+  for (int t = 0; t < degreeBins; ++t) {
+    float theta = (t * stepDeg) * deg2rad;
+    pcCos[t] = cosf(theta);
+    pcSin[t] = sinf(theta);
+  }
+}
+
+// Guarda el acumulador (r x theta) como PGM P5 normalizado 0..255
+static void saveAccumulatorAsPGM(const char *path, const int *h_acc,
+                                int rBins, int degreeBins)
+{
+  const int total = rBins * degreeBins;
+  int vmax = 0;
+  for (int i = 0; i < total; ++i) if (h_acc[i] > vmax) vmax = h_acc[i];
+  if (vmax == 0) vmax = 1;
+
+  unsigned char *img = (unsigned char *)malloc(total);
+  for (int i = 0; i < total; ++i) {
+    float v = (float)h_acc[i] / (float)vmax;
+    int gi = (int)lrintf(255.0f * v);
+    if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+    img[i] = (unsigned char)gi;
+  }
+
+  FILE *f = fopen(path, "wb");
+  if (!f) { fprintf(stderr, "No pude abrir %s para escribir.\n", path); free(img); return; }
+  // Nota: ancho = degreeBins, alto = rBins (imagen del acumulador)
+  fprintf(f, "P5\n%d %d\n255\n", degreeBins, rBins);
+  fwrite(img, 1, total, f);
+  fclose(f);
+  free(img);
 }
 
 //*****************************************************************
@@ -121,6 +155,11 @@ int main (int argc, char **argv)
 {
   int i;
 
+  if (argc < 2) {
+    fprintf(stderr, "Uso: %s input.pgm [output_accum.pgm]\n", argv[0]);
+    return 1;
+  }
+  
   PGMImage inImg (argv[1]);
 
   int *cpuht;
@@ -133,24 +172,23 @@ int main (int argc, char **argv)
   cudaMalloc ((void **) &d_Cos, sizeof (float) * degreeBins);
   cudaMalloc ((void **) &d_Sin, sizeof (float) * degreeBins);
 
-  // CPU calculation
-  CPU_HoughTran(inImg.pixels, w, h, &cpuht);
 
+  // Tabla de seno/coseno en host (mismo muestreo que degreeBins)
   // pre-compute values to be stored
   float *pcCos = (float *) malloc (sizeof (float) * degreeBins);
   float *pcSin = (float *) malloc (sizeof (float) * degreeBins);
-  float rad = 0;
-  for (i = 0; i < degreeBins; i++)
-  {
-    pcCos[i] = cos (rad);
-    pcSin[i] = sin (rad);
-    rad += radInc;
-  }
+  computeSinCosTable(pcCos, pcSin, degreeBins);
 
-  float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;
-  float rScale = 2 * rMax / rBins;
+  float rMax   = sqrtf((float)w * w + (float)h * h) / 2.0f;
+  float rScale = 2.0f * rMax / rBins;
 
-  // TODO eventualmente volver memoria global
+  // CPU calculation
+  CPU_HoughTran(inImg.pixels, w, h, &cpuht, pcCos, pcSin, rMax, rScale);
+
+  printf("Params: w=%d h=%d degreeBins=%d rBins=%d rMax=%.9f rScale=%.9f\n",
+       w, h, degreeBins, rBins, rMax, rScale);
+
+  // Copiar LUT sin/cos (host → device global). Versión baseline sin optimizar.
   cudaMemcpy(d_Cos, pcCos, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
   cudaMemcpy(d_Sin, pcSin, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
 
@@ -169,11 +207,41 @@ int main (int argc, char **argv)
 
   // execution configuration uses a 1-D grid of 1-D blocks, each made of 256 threads
   //1 thread por pixel
-  int blockNum = ceil (w * h / 256);
-  GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+  int blockNum = (w * h + 256 - 1) / 256;
+
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventRecord(start);
+
+  accumulateHoughGPU <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+
+  // Chequeo de error de lanzamiento del kernel
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(err));
+  }
+
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, start, stop);
+  printf("Kernel (baseline global) time: %.3f ms\n", ms);
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
+  cudaDeviceSynchronize();
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA runtime error after sync: %s\n", cudaGetErrorString(err));
+  }
 
   // get results from device
   cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
+
+  saveAccumulatorAsPGM("output_gpu.pgm", h_hough, rBins, degreeBins);
+  printf("Acumulador guardado en output_gpu.pgm (alto=rBins=%d, ancho=degreeBins=%d)\n",
+        rBins, degreeBins);
 
   // compare CPU and GPU results
   for (i = 0; i < degreeBins * rBins; i++)
@@ -183,7 +251,17 @@ int main (int argc, char **argv)
   }
   printf("Done!\n");
 
-  // TODO clean-up
+  // clean-up
+
+  cudaFree(d_in);
+  cudaFree(d_hough);
+  cudaFree(d_Cos);
+  cudaFree(d_Sin);
+
+  free(h_hough);
+  delete[] cpuht;   // cpuht fue creado con new[] en CPU_HoughTran
+  free(pcCos);
+  free(pcSin);
 
   return 0;
 }
