@@ -88,16 +88,16 @@ __global__ void accumulateHoughGPU(const unsigned char *pic, int w, int h,
                                    const float *d_Cos, const float *d_Sin)
 {
   int gloID = blockIdx.x * blockDim.x + threadIdx.x;
-  if (gloID >= w * h) return;      // ¡Ojo! >= (no >)
+  if (gloID >= w * h) return;
 
   const int xCent = w / 2;
   const int yCent = h / 2;
 
-  // Origen al centro y eje Y hacia arriba (convención cartesiana)
+  // Origen al centro y eje Y hacia arriba
   int xCoord = (gloID % w) - xCent;
   int yCoord = yCent - (gloID / w);
 
-  // Sólo votan los píxeles > 0 (asumiendo imagen ya umbralizada/edges)
+  // Sólo votan los píxeles > 0
   if (pic[gloID] == 0) return;
 
   for (int tIdx = 0; tIdx < degreeBins; ++tIdx)
