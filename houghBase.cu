@@ -12,14 +12,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <cuda.h>
+#include <cuda_runtime.h>
 #include <string.h>
 #include "common/pgm.h"
 
 const int degreeInc = 2;
 const int degreeBins = 180 / degreeInc;
 const int rBins = 100;
-const float radInc = degreeInc * M_PI / 180;
+// const float radInc = degreeInc * M_PI / 180;
+
+// HELPERS
+static inline int rnint_to_int_host(float v) {
+  // nearest-even en CPU
+  return (int)nearbyintf(v);
+}
+
 //*****************************************************************
 // The CPU function returns a pointer to the accummulator
 void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
