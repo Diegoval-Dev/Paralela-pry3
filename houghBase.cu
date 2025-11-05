@@ -63,22 +63,94 @@ void CPU_HoughTran(unsigned char *pic, int w, int h, int **acc,
 }
 
 //*****************************************************************
-// TODO usar memoria constante para la tabla de senos y cosenos
-// inicializarlo en main y pasarlo al device
-//__constant__ float d_Cos[degreeBins];
-//__constant__ float d_Sin[degreeBins];
+// Memoria constante para tablas de senos y cosenos
+__constant__ float d_Cos_const[degreeBins];
+__constant__ float d_Sin_const[degreeBins];
 
 //*****************************************************************
-//TODO Kernel memoria compartida
-// __global__ void GPU_HoughTranShared(...)
-// {
-//   //TODO
-// }
-//TODO Kernel memoria Constante
-// __global__ void GPU_HoughTranConst(...)
-// {
-//   //TODO
-// }
+// GPU kernel con memoria Compartida: acumulador local por bloque
+__global__ void GPU_HoughTranShared(const unsigned char *pic, int w, int h,
+                                    int *acc, float rMax, float rScale)
+{
+  int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+  int locID = threadIdx.x;
+
+  // Acumulador local en shared memory
+  __shared__ int localAcc[degreeBins * rBins];
+
+  // Inicializar acumulador local a 0 (distribuir entre threads del bloque)
+  for (int i = locID; i < degreeBins * rBins; i += blockDim.x) {
+    localAcc[i] = 0;
+  }
+
+  // Barrera de sincronización
+  __syncthreads();
+
+  // Solo procesar si el thread tiene un pixel válido
+  if (gloID < w * h) {
+    const int xCent = w / 2;
+    const int yCent = h / 2;
+
+    // Origen al centro y eje Y hacia arriba
+    int xCoord = (gloID % w) - xCent;
+    int yCoord = yCent - (gloID / w);
+
+    // Solo votan los píxeles > 0
+    if (pic[gloID] > 0) {
+      for (int tIdx = 0; tIdx < degreeBins; ++tIdx)
+      {
+        // Usar memoria constante para las tablas
+        float r = __fmaf_rn((float)xCoord, d_Cos_const[tIdx], (float)yCoord * d_Sin_const[tIdx]);
+        float v = (r + rMax) / rScale;
+        int rIdx = __float2int_rn(v);
+        if (rIdx < 0) rIdx = 0;
+        else if (rIdx >= rBins) rIdx = rBins - 1;
+
+        // Votar en acumulador LOCAL con atomicAdd
+        atomicAdd(&localAcc[rIdx * degreeBins + tIdx], 1);
+      }
+    }
+  }
+
+  // Segunda barrera de sincronización
+  __syncthreads();
+
+  // Copiar acumulador local → global (distribuir entre threads del bloque)
+  for (int i = locID; i < degreeBins * rBins; i += blockDim.x) {
+    if (localAcc[i] > 0) {
+      atomicAdd(&acc[i], localAcc[i]);
+    }
+  }
+}
+// GPU kernel con memoria Constante: usa tablas cos/sin en memoria constante
+__global__ void GPU_HoughTranConst(const unsigned char *pic, int w, int h,
+                                   int *acc, float rMax, float rScale)
+{
+  int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gloID >= w * h) return;
+
+  const int xCent = w / 2;
+  const int yCent = h / 2;
+
+  // Origen al centro y eje Y hacia arriba
+  int xCoord = (gloID % w) - xCent;
+  int yCoord = yCent - (gloID / w);
+
+  // Sólo votan los píxeles > 0
+  if (pic[gloID] == 0) return;
+
+  for (int tIdx = 0; tIdx < degreeBins; ++tIdx)
+  {
+    // Usar memoria constante directamente
+    float r = __fmaf_rn((float)xCoord, d_Cos_const[tIdx], (float)yCoord * d_Sin_const[tIdx]);
+    float v = (r + rMax) / rScale;
+    int rIdx = __float2int_rn(v);
+    if (rIdx < 0) rIdx = 0;
+    else if (rIdx >= rBins) rIdx = rBins - 1;
+
+    atomicAdd(&acc[rIdx * degreeBins + tIdx], 1);
+  }
+}
 
 // GPU kernel. One thread per image pixel is spawned.
 // The accummulator memory needs to be allocated by the host in global memory
@@ -150,63 +222,119 @@ static void saveAccumulatorAsPGM(const char *path, const int *h_acc,
   free(img);
 }
 
-//*****************************************************************
-int main (int argc, char **argv)
+// Detecta líneas con votos > threshold y las dibuja sobre la imagen original
+static void drawDetectedLines(const char *outputPath, const unsigned char *originalImg,
+                             int w, int h, const int *h_acc, int rBins, int degreeBins,
+                             const float *pcCos, const float *pcSin, float rMax, float rScale)
 {
-  int i;
-
-  if (argc < 2) {
-    fprintf(stderr, "Uso: %s input.pgm [output_accum.pgm]\n", argv[0]);
-    return 1;
+  // Calcular threshold: promedio + 2*stddev o max/4, lo que sea mayor
+  int total = rBins * degreeBins;
+  int sum = 0, vmax = 0;
+  for (int i = 0; i < total; i++) {
+    sum += h_acc[i];
+    if (h_acc[i] > vmax) vmax = h_acc[i];
   }
-  
-  PGMImage inImg (argv[1]);
+  float mean = (float)sum / total;
 
-  int *cpuht;
-  int w = inImg.x_dim;
-  int h = inImg.y_dim;
+  float variance = 0.0f;
+  for (int i = 0; i < total; i++) {
+    float diff = h_acc[i] - mean;
+    variance += diff * diff;
+  }
+  float stddev = sqrtf(variance / total);
 
-  float* d_Cos;
-  float* d_Sin;
+  int threshold = (int)(mean + 2.0f * stddev);
+  int threshold_alt = vmax / 4;
+  if (threshold_alt > threshold) threshold = threshold_alt;
 
-  cudaMalloc ((void **) &d_Cos, sizeof (float) * degreeBins);
-  cudaMalloc ((void **) &d_Sin, sizeof (float) * degreeBins);
+  printf("Threshold para detección de líneas: %d (mean=%.1f, stddev=%.1f, max=%d)\n",
+         threshold, mean, stddev, vmax);
 
+  // Crear imagen RGB (3 canales) para dibujar líneas a color
+  unsigned char *rgbImg = (unsigned char *)malloc(w * h * 3);
+  for (int i = 0; i < w * h; i++) {
+    // Convertir escala de grises a RGB
+    rgbImg[i*3] = originalImg[i];     // R
+    rgbImg[i*3+1] = originalImg[i];   // G
+    rgbImg[i*3+2] = originalImg[i];   // B
+  }
 
-  // Tabla de seno/coseno en host (mismo muestreo que degreeBins)
-  // pre-compute values to be stored
-  float *pcCos = (float *) malloc (sizeof (float) * degreeBins);
-  float *pcSin = (float *) malloc (sizeof (float) * degreeBins);
-  computeSinCosTable(pcCos, pcSin, degreeBins);
+  int linesDrawn = 0;
 
-  float rMax   = sqrtf((float)w * w + (float)h * h) / 2.0f;
-  float rScale = 2.0f * rMax / rBins;
+  // Buscar picos en el acumulador y dibujar líneas
+  for (int rIdx = 0; rIdx < rBins; rIdx++) {
+    for (int tIdx = 0; tIdx < degreeBins; tIdx++) {
+      int votes = h_acc[rIdx * degreeBins + tIdx];
 
-  // CPU calculation
-  CPU_HoughTran(inImg.pixels, w, h, &cpuht, pcCos, pcSin, rMax, rScale);
+      if (votes > threshold) {
+        // Convertir de índices a parámetros reales
+        float r = (rIdx * rScale) - rMax;
+        float cosTheta = pcCos[tIdx];
+        float sinTheta = pcSin[tIdx];
 
-  printf("Params: w=%d h=%d degreeBins=%d rBins=%d rMax=%.9f rScale=%.9f\n",
-       w, h, degreeBins, rBins, rMax, rScale);
+        // Dibujar la línea r = x*cos(θ) + y*sin(θ)
+        // Para cada x, calcular y = (r - x*cos(θ)) / sin(θ)
+        // Para cada y, calcular x = (r - y*sin(θ)) / cos(θ)
 
-  // Copiar LUT sin/cos (host → device global). Versión baseline sin optimizar.
-  cudaMemcpy(d_Cos, pcCos, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_Sin, pcSin, sizeof (float) * degreeBins, cudaMemcpyHostToDevice);
+        for (int x = 0; x < w; x++) {
+          if (fabs(sinTheta) > 0.001f) { // Evitar división por cero
+            float y_real = (r - (x - w/2) * cosTheta) / sinTheta + h/2;
+            int y = (int)lrintf(y_real);
+            if (y >= 0 && y < h) {
+              int idx = y * w + x;
+              // Dibujar en rojo
+              rgbImg[idx*3] = 255;     // R
+              rgbImg[idx*3+1] = 0;     // G
+              rgbImg[idx*3+2] = 0;     // B
+            }
+          }
+        }
 
-  // setup and copy data from host to device
-  unsigned char *d_in, *h_in;
-  int *d_hough, *h_hough;
+        for (int y = 0; y < h; y++) {
+          if (fabs(cosTheta) > 0.001f) { // Evitar división por cero
+            float x_real = (r - (y - h/2) * sinTheta) / cosTheta + w/2;
+            int x = (int)lrintf(x_real);
+            if (x >= 0 && x < w) {
+              int idx = y * w + x;
+              // Dibujar en rojo
+              rgbImg[idx*3] = 255;     // R
+              rgbImg[idx*3+1] = 0;     // G
+              rgbImg[idx*3+2] = 0;     // B
+            }
+          }
+        }
 
-  h_in = inImg.pixels; // h_in contiene los pixeles de la imagen
+        linesDrawn++;
+        printf("Línea detectada: r=%.2f, θ=%d°, votos=%d\n",
+               r, tIdx * 2, votes);
+      }
+    }
+  }
 
-  h_hough = (int *) malloc (degreeBins * rBins * sizeof (int));
+  printf("Total de líneas dibujadas: %d\n", linesDrawn);
 
-  cudaMalloc ((void **) &d_in, sizeof (unsigned char) * w * h);
-  cudaMalloc ((void **) &d_hough, sizeof (int) * degreeBins * rBins);
-  cudaMemcpy (d_in, h_in, sizeof (unsigned char) * w * h, cudaMemcpyHostToDevice);
-  cudaMemset (d_hough, 0, sizeof (int) * degreeBins * rBins);
+  // Guardar como PPM P6 (color)
+  FILE *f = fopen(outputPath, "wb");
+  if (!f) {
+    fprintf(stderr, "No pude abrir %s para escribir.\n", outputPath);
+    free(rgbImg);
+    return;
+  }
 
-  // execution configuration uses a 1-D grid of 1-D blocks, each made of 256 threads
-  //1 thread por pixel
+  fprintf(f, "P6\n%d %d\n255\n", w, h);
+  fwrite(rgbImg, 3, w * h, f);
+  fclose(f);
+  free(rgbImg);
+
+  printf("Imagen con líneas guardada en: %s\n", outputPath);
+}
+
+//*****************************************************************
+// Función auxiliar para ejecutar una versión específica del kernel
+static float runKernelVersion(int version, unsigned char *d_in, int w, int h,
+                             int *d_hough, float rMax, float rScale,
+                             float *d_Cos, float *d_Sin)
+{
   int blockNum = (w * h + 256 - 1) / 256;
 
   cudaEvent_t start, stop;
@@ -214,54 +342,33 @@ int main (int argc, char **argv)
   cudaEventCreate(&stop);
   cudaEventRecord(start);
 
-  accumulateHoughGPU <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+  switch(version) {
+    case 1: // Global memory
+      accumulateHoughGPU<<<blockNum, 256>>>(d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+      break;
+    case 2: // Constant memory
+      GPU_HoughTranConst<<<blockNum, 256>>>(d_in, w, h, d_hough, rMax, rScale);
+      break;
+    case 3: // Shared memory
+      GPU_HoughTranShared<<<blockNum, 256>>>(d_in, w, h, d_hough, rMax, rScale);
+      break;
+    default:
+      fprintf(stderr, "Versión de kernel inválida: %d\n", version);
+      return -1.0f;
+  }
 
-  // Chequeo de error de lanzamiento del kernel
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     fprintf(stderr, "CUDA kernel launch error: %s\n", cudaGetErrorString(err));
+    return -1.0f;
   }
 
   cudaEventRecord(stop);
   cudaEventSynchronize(stop);
   float ms = 0.0f;
   cudaEventElapsedTime(&ms, start, stop);
-  printf("Kernel (baseline global) time: %.3f ms\n", ms);
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
 
-  cudaDeviceSynchronize();
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA runtime error after sync: %s\n", cudaGetErrorString(err));
-  }
-
-  // get results from device
-  cudaMemcpy (h_hough, d_hough, sizeof (int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
-
-  saveAccumulatorAsPGM("output_gpu.pgm", h_hough, rBins, degreeBins);
-  printf("Acumulador guardado en output_gpu.pgm (alto=rBins=%d, ancho=degreeBins=%d)\n",
-        rBins, degreeBins);
-
-  // compare CPU and GPU results
-  for (i = 0; i < degreeBins * rBins; i++)
-  {
-    if (cpuht[i] != h_hough[i])
-      printf ("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
-  }
-  printf("Done!\n");
-
-  // clean-up
-
-  cudaFree(d_in);
-  cudaFree(d_hough);
-  cudaFree(d_Cos);
-  cudaFree(d_Sin);
-
-  free(h_hough);
-  delete[] cpuht;   // cpuht fue creado con new[] en CPU_HoughTran
-  free(pcCos);
-  free(pcSin);
-
-  return 0;
+  return ms;
 }
