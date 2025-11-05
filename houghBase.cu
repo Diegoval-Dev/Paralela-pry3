@@ -29,33 +29,37 @@ static inline int rnint_to_int_host(float v) {
 
 //*****************************************************************
 // The CPU function returns a pointer to the accummulator
-void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
+void CPU_HoughTran(unsigned char *pic, int w, int h, int **acc,
+                   const float *pcCos, const float *pcSin,
+                   float rMax, float rScale)
 {
-  float rMax = sqrt (1.0 * w * w + 1.0 * h * h) / 2;  //(w^2 + h^2)/2, radio max equivalente a centro -> esquina
-  *acc = new int[rBins * degreeBins];            //el acumulador, conteo depixeles encontrados, 90*180/degInc = 9000
-  memset (*acc, 0, sizeof (int) * rBins * degreeBins); //init en ceros
+  *acc = new int[rBins * degreeBins];
+  memset(*acc, 0, sizeof(int) * rBins * degreeBins);
+
   int xCent = w / 2;
   int yCent = h / 2;
-  float rScale = 2 * rMax / rBins;
 
-  for (int i = 0; i < w; i++) //por cada pixel
-    for (int j = 0; j < h; j++) //...
-      {
-        int idx = j * w + i;
-        if (pic[idx] > 0) //si pasa thresh, entonces lo marca
-          {
-            int xCoord = i - xCent;
-            int yCoord = yCent - j;  // y-coord has to be reversed
-            float theta = 0;         // actual angle
-            for (int tIdx = 0; tIdx < degreeBins; tIdx++) //add 1 to all lines in that pixel
-              {
-                float r = xCoord * cos (theta) + yCoord * sin (theta);
-                int rIdx = (r + rMax) / rScale;
-                (*acc)[rIdx * degreeBins + tIdx]++; //+1 para este radio r y este theta
-                theta += radInc;
-              }
-          }
+  for (int i = 0; i < w; ++i) {
+    for (int j = 0; j < h; ++j) {
+      int idx = j * w + i;
+      if (pic[idx] > 0) {
+        int xCoord = i - xCent;
+        int yCoord = yCent - j;  // igual que en GPU
+
+        for (int tIdx = 0; tIdx < degreeBins; ++tIdx) {
+          float r = fmaf((float)xCoord, pcCos[tIdx], (float)yCoord * pcSin[tIdx]);
+          float v = (r + rMax) / rScale;
+          int rIdx = rnint_to_int_host(v);
+
+          // clamp idéntico al GPU
+          if (rIdx < 0) rIdx = 0;
+          else if (rIdx >= rBins) rIdx = rBins - 1;
+
+          (*acc)[rIdx * degreeBins + tIdx]++; // en CPU es ++
+        }
       }
+    }
+  }
 }
 
 //*****************************************************************
