@@ -372,3 +372,25 @@ static float runKernelVersion(int version, unsigned char *d_in, int w, int h,
 
   return ms;
 }
+
+//*****************************************************************
+int main (int argc, char **argv)
+{
+  
+
+  printf("=== LIMPIEZA ===\n");
+
+  // Cleanup
+  cudaFree(d_in);
+  cudaFree(d_hough);
+  cudaFree(d_Cos);
+  cudaFree(d_Sin);
+
+  free(h_hough);
+  delete[] cpuht;
+  free(pcCos);
+  free(pcSin);
+
+  printf("Ejecución completada\n");
+  return 0;
+}
