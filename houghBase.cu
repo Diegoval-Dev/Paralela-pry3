@@ -376,7 +376,120 @@ static float runKernelVersion(int version, unsigned char *d_in, int w, int h,
 //*****************************************************************
 int main (int argc, char **argv)
 {
-  
+  if (argc < 2) {
+    fprintf(stderr, "Uso: %s input.pgm [version]\n", argv[0]);
+    fprintf(stderr, "  version: 1=Global, 2=Constant, 3=Shared, 0=All (default)\n");
+    return 1;
+  }
+
+  int version = 0; // Por defecto ejecutar todas las versiones
+  if (argc >= 3) {
+    version = atoi(argv[2]);
+    if (version < 0 || version > 3) {
+      fprintf(stderr, "Versión debe ser 0-3\n");
+      return 1;
+    }
+  }
+
+  PGMImage inImg(argv[1]);
+  int w = inImg.x_dim;
+  int h = inImg.y_dim;
+
+  printf("=== TRANSFORMADA DE HOUGH EN CUDA ===\n");
+  printf("Imagen: %s (%dx%d)\n", argv[1], w, h);
+  printf("Parámetros: degreeBins=%d, rBins=%d\n", degreeBins, rBins);
+
+  // Tabla de seno/coseno en host
+  float *pcCos = (float *)malloc(sizeof(float) * degreeBins);
+  float *pcSin = (float *)malloc(sizeof(float) * degreeBins);
+  computeSinCosTable(pcCos, pcSin, degreeBins);
+
+  float rMax = sqrtf((float)w * w + (float)h * h) / 2.0f;
+  float rScale = 2.0f * rMax / rBins;
+
+  printf("rMax=%.3f, rScale=%.6f\n\n", rMax, rScale);
+
+  // CPU calculation para referencia
+  int *cpuht;
+  CPU_HoughTran(inImg.pixels, w, h, &cpuht, pcCos, pcSin, rMax, rScale);
+  printf("CPU Hough Transform completado\n\n");
+
+  // Setup GPU memory
+  unsigned char *d_in;
+  int *d_hough, *h_hough;
+  float *d_Cos, *d_Sin;
+
+  cudaMalloc((void **)&d_in, sizeof(unsigned char) * w * h);
+  cudaMalloc((void **)&d_hough, sizeof(int) * degreeBins * rBins);
+  cudaMalloc((void **)&d_Cos, sizeof(float) * degreeBins);
+  cudaMalloc((void **)&d_Sin, sizeof(float) * degreeBins);
+
+  h_hough = (int *)malloc(degreeBins * rBins * sizeof(int));
+
+  // Copiar datos a GPU
+  cudaMemcpy(d_in, inImg.pixels, sizeof(unsigned char) * w * h, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_Cos, pcCos, sizeof(float) * degreeBins, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_Sin, pcSin, sizeof(float) * degreeBins, cudaMemcpyHostToDevice);
+
+  // Copiar tablas a memoria constante (para versiones 2 y 3)
+  cudaMemcpyToSymbol(d_Cos_const, pcCos, sizeof(float) * degreeBins);
+  cudaMemcpyToSymbol(d_Sin_const, pcSin, sizeof(float) * degreeBins);
+
+  const char* versionNames[] = {"", "Global Memory", "Constant Memory", "Shared Memory"};
+
+  // Ejecutar versión(es) especificada(s)
+  int startVer = (version == 0) ? 1 : version;
+  int endVer = (version == 0) ? 3 : version;
+
+  for (int v = startVer; v <= endVer; v++) {
+    printf("=== EJECUTANDO VERSIÓN %d: %s ===\n", v, versionNames[v]);
+
+    // Limpiar acumulador
+    cudaMemset(d_hough, 0, sizeof(int) * degreeBins * rBins);
+
+    // Ejecutar kernel
+    float ms = runKernelVersion(v, d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
+
+    if (ms < 0) {
+      printf("Error ejecutando versión %d\n", v);
+      continue;
+    }
+
+    printf("Tiempo de kernel: %.3f ms\n", ms);
+
+    // Obtener resultados
+    cudaMemcpy(h_hough, d_hough, sizeof(int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
+
+    // Verificar resultados contra CPU
+    int mismatches = 0;
+    for (int i = 0; i < degreeBins * rBins; i++) {
+      if (cpuht[i] != h_hough[i]) {
+        mismatches++;
+        if (mismatches <= 5) { // Solo mostrar primeros 5 errores
+          printf("Mismatch en %d: CPU=%d, GPU=%d\n", i, cpuht[i], h_hough[i]);
+        }
+      }
+    }
+
+    if (mismatches == 0) {
+      printf("✓ Resultados coinciden con CPU\n");
+    } else {
+      printf("✗ %d diferencias encontradas\n", mismatches);
+    }
+
+    // Guardar resultados específicos de esta versión
+    char outputPath[256];
+    sprintf(outputPath, "output_v%d.pgm", v);
+    saveAccumulatorAsPGM(outputPath, h_hough, rBins, degreeBins);
+    printf("Acumulador guardado: %s\n", outputPath);
+
+    // Generar imagen con líneas detectadas
+    sprintf(outputPath, "lines_v%d.ppm", v);
+    drawDetectedLines(outputPath, inImg.pixels, w, h, h_hough, rBins, degreeBins,
+                     pcCos, pcSin, rMax, rScale);
+
+    printf("\n");
+  }
 
   printf("=== LIMPIEZA ===\n");
 
