@@ -47,14 +47,6 @@ desktop.ini
 venv/
 .env/
 
-# Temporary test images or outputs
-*.pgm
-*.ppm
-*.png
-*.jpg
-*.jpeg
-*.bmp
-
 # Misc
 *.bak
 *.tmp
